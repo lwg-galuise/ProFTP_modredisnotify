@@ -22,7 +22,7 @@ Once the libhiredis code is in place the build command will change to:
 prxs -c -i -d -L /usr/lib/x86_64-linux-gnu/ -l json-c -l :libhiredis.so.0.14 mod_restnotify.c
 ```
 
-**NOTE: ** The above command assumes the version 0.14 libhiredis.so
+**NOTE:** The above command assumes the version 0.14 libhiredis.so
 installed by the packages in Debian 10.
 
 
