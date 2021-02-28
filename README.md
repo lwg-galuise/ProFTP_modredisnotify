@@ -12,7 +12,18 @@ and will report the true filename to the subscribed endpoint.
 To build this module issue the following commands on any Linux machine
 with ProFTPD installed:
 
-sudo prcx -c -i -d mod_restnotify.c
+```sh
+sudo prcx -c -i -d -l jason-c mod_restnotify.c
+```
+
+Once the libhiredis code is in place the build command will change to:
+
+```sh
+prxs -c -i -d -L /usr/lib/x86_64-linux-gnu/ -l json-c -l :libhiredis.so.0.14 mod_restnotify.c
+```
+
+**NOTE: ** The above command assumes the version 0.14 libhiredis.so
+installed by the packages in Debian 10.
 
 
 Then the following section will need to be added to the ProFTPD
