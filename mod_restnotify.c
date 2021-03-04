@@ -12,8 +12,10 @@
 #include <string.h>
 
 #include <curl/curl.h>
-//#include <cjson/cJSON.h>
 #include <json-c/json.h>
+#include <hiredis.h>
+#include <hiredis_ssl.h>
+//#include <cjson/cJSON.h>
 //#include <libxml/encoding.h>
 //#include <libxml/xmlwriter.h>
 
@@ -36,15 +38,60 @@ void dump_table(const char *, ...);
 //}
 
 /**
- * Configuration setter: notifyEndpoint
+ * Configuration setter: notifyStreamName
  */
-MODRET set_notify_endpoint(cmd_rec *cmd) {
+MODRET set_config_notify_stream_name(cmd_rec *cmd) {
   config_rec *c = NULL;
 
   CHECK_ARGS(cmd, 1);
   CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_DIR);
 
-  c = add_config_param_str("NotifyEndpoint", 1, (void *) cmd->argv[1]);
+  c = add_config_param_str("NotifyStreamName", 1, (void *) cmd->argv[1]);
+  c->flags |= CF_MERGEDOWN;
+
+  return PR_HANDLED(cmd);
+}
+
+/**
+ * Configuration setter: redisHost
+ */
+MODRET set_config_redis_host(cmd_rec *cmd) {
+  config_rec *c = NULL;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_DIR);
+
+  c = add_config_param_str("RedisHost", 1, (void *) cmd->argv[1]);
+  c->flags |= CF_MERGEDOWN;
+
+  return PR_HANDLED(cmd);
+}
+
+/**
+ * Configuration setter: redisPort
+ */
+MODRET set_config_redis_port(cmd_rec *cmd) {
+  config_rec *c = NULL;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_DIR);
+
+  c = add_config_param_str("RedisPort", 1, (void *) cmd->argv[1]);
+  c->flags |= CF_MERGEDOWN;
+
+  return PR_HANDLED(cmd);
+}
+
+/**
+ * Configuration setter: redisAuth
+ */
+MODRET set_config_redis_auth(cmd_rec *cmd) {
+  config_rec *c = NULL;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_DIR);
+
+  c = add_config_param_str("RedisAuth", 1, (void *) cmd->argv[1]);
   c->flags |= CF_MERGEDOWN;
 
   return PR_HANDLED(cmd);
@@ -287,7 +334,10 @@ MODRET capture_rename_to(cmd_rec *cmd)
 
 
 static conftable restnotify_conftab[] = {
-  { "NotifyEndpoint", set_notify_endpoint, NULL },
+  { "RedisHost", set_config_redis_host, NULL },
+  { "RedisPort", set_config_redis_port, NULL },
+  { "RedisAuth", set_config_redis_auth, NULL },
+  { "NotifyStreamName", set_config_notify_stream_name, NULL },
   { NULL }
 };
 
