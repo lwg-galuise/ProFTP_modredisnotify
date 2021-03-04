@@ -97,7 +97,7 @@ MODRET set_config_redis_auth(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
-static int handle_upload_table_cb(const void *key, size_t keysz, const void *value,
+static int handle_upload_table_record_cb(const void *key, size_t keysz, const void *value,
 		size_t valuesz, void *user_data)
 {
 	//cJSON_AddItemToArray((cJSON*)user_data,cJSON_CreateString((char*)key));
@@ -113,6 +113,122 @@ static int handle_upload_table_cb(const void *key, size_t keysz, const void *val
 	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: tab[%s](%lu)=%s(%lu)",
 			(char*)key, keysz, (char*)value, valuesz);
 	*/
+	return 0;
+}
+
+static int push_redis_stream_notification(json_object *msg)
+{
+	char *redisHost, *redisAuth, *redisStreamKey;
+	struct timeval redisTimeout = { 1, 500000 }; // 1.5 seconds
+	int redisPort = 6379; // the default
+
+	config_rec *config;
+	redisSSLContext *ssl;
+	redisSSLContextError ssl_error;
+	redisContext *redisCtx;
+	redisReply *reply;
+
+	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisHost",FALSE);
+	if (!config || !strlen(config->argv[0]))
+	{
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": 'RedisHost' parameter mising or blank - cannot send notification");
+		return 1;
+	}
+	redisHost = (char *) config->argv[0];
+
+	config = find_config(CURRENT_CONF, CONF_PARAM,"NotifyStreamName",FALSE);
+	if (!config || !strlen(config->argv[0]))
+	{
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": 'NotifyStreamName' parameter missing or blank - cannot send notification");
+		return 1;
+	}
+	redisStreamKey = (char *) config->argv[0];
+
+	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisPort",FALSE);
+	if (config && strlen(config->argv[0]))
+		redisPort = atoi((char *)config->argv[0]);
+
+	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisAuth",FALSE);
+	if (config && strlen(config->argv[0]))
+		redisAuth = (char *)config->argv[0];
+	else
+		redisAuth = NULL;
+
+	redisInitOpenSSL();
+	ssl = redisCreateSSLContext(NULL, "/etc/ssl/certs", NULL, NULL, NULL, &ssl_error);
+	if (!ssl)
+	{
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": SSL Context error: %s\n", redisSSLContextGetError(ssl_error));
+		return 1;
+	}
+
+	redisOptions options = {0};
+	REDIS_OPTIONS_SET_TCP(&options, redisHost, redisPort);
+	options.connect_timeout = &redisTimeout;
+	redisCtx = redisConnectWithOptions(&options);
+
+	if (NULL==redisCtx || redisCtx->err)
+	{
+		if (redisCtx)
+		{
+			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+				": Connection error: %s\n", redisCtx->errstr);
+			redisFree(redisCtx);
+		}
+		else
+			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+				": Connection error: can't allocate redis context\n");
+		return 1;
+	}
+
+	if (REDIS_OK!=redisInitiateSSLWithContext(redisCtx, ssl))
+	{
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": Couldn't initialize SSL!\n");
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": Error: %s\n", redisCtx->errstr);
+		redisFree(redisCtx);
+		return 1;
+	}
+
+	if (redisAuth)
+	{
+		reply = redisCommand(redisCtx,"AUTH %s", redisAuth);
+		if (REDIS_OK!=reply->type)
+		{
+			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+				": AUTH Failure - Wrong 'RedisAuth' value?: %s\n", reply->str);
+
+			freeReplyObject(reply);
+			redisFree(redisCtx);
+			redisFreeSSLContext(ssl);
+			return 1;
+		}
+
+		freeReplyObject(reply);
+	}
+
+	reply = redisCommand(redisCtx, "XADD \"%s\" MAXLEN ~ 10000 * sftpDropOff \"%s\"",
+		redisStreamKey, json_object_to_json_string(msg));
+
+	if (REDIS_OK!=reply->type)
+	{
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": Failed to push notification to redis stream: %s\n",
+			reply->str);
+		freeReplyObject(reply);
+		redisFree(redisCtx);
+		redisFreeSSLContext(ssl);
+		return 1;
+	}
+
+	
+	freeReplyObject(reply);
+	redisFree(redisCtx);
+	redisFreeSSLContext(ssl);
 	return 0;
 }
 
@@ -137,7 +253,7 @@ static void restnotify_shutdown(const void *event_data, void *user_data)
 		json_object *filesArray = json_object_new_array();
 		//cJSON *msg = cJSON_CreateObject();
 		//cJSON *files = cJSON_AddArrayToObject(msg,"files");
-		pr_table_do((pr_table_t*)uploaded_table, handle_upload_table_cb, filesArray, 0);
+		pr_table_do((pr_table_t*)uploaded_table, handle_upload_table_record_cb, filesArray, 0);
 
 		json_object_object_add(msg,"files",filesArray);
 
@@ -145,6 +261,8 @@ static void restnotify_shutdown(const void *event_data, void *user_data)
 
 		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: JSON: %s",
 			json_object_to_json_string(msg));
+
+		push_redis_stream_notification(msg);
 		
 		//cJSON_Delete(msg);
 
