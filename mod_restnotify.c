@@ -1,3 +1,8 @@
+/*
+ * mod_restnotify.c: A module to notify endpoints of files uploaded.
+ *
+ * $Libraries: -ljson-c -lhiredis$
+ */
 #include "conf.h"
 #include "privs.h"
 #include <libgen.h>
@@ -14,7 +19,7 @@
 #include <curl/curl.h>
 #include <json-c/json.h>
 #include <hiredis.h>
-#include <hiredis_ssl.h>
+//#include <hiredis_ssl.h>
 //#include <cjson/cJSON.h>
 //#include <libxml/encoding.h>
 //#include <libxml/xmlwriter.h>
@@ -53,6 +58,21 @@ MODRET set_config_notify_stream_name(cmd_rec *cmd) {
 }
 
 /**
+ * Configuration setter: redisUnixSocket
+ */
+MODRET set_config_redis_unix_socket(cmd_rec *cmd) {
+  config_rec *c = NULL;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_DIR);
+
+  c = add_config_param_str("RedisUnixSocket", 1, (void *) cmd->argv[1]);
+  c->flags |= CF_MERGEDOWN;
+
+  return PR_HANDLED(cmd);
+}
+
+/**
  * Configuration setter: redisHost
  */
 MODRET set_config_redis_host(cmd_rec *cmd) {
@@ -63,6 +83,9 @@ MODRET set_config_redis_host(cmd_rec *cmd) {
 
   c = add_config_param_str("RedisHost", 1, (void *) cmd->argv[1]);
   c->flags |= CF_MERGEDOWN;
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: adding RedisHost: '%s'",
+		(char *)cmd->argv[1]);
 
   return PR_HANDLED(cmd);
 }
@@ -116,26 +139,125 @@ static int handle_upload_table_record_cb(const void *key, size_t keysz, const vo
 	return 0;
 }
 
-static int push_redis_stream_notification(json_object *msg)
+static redisContext* get_redis_context()
 {
-	char *redisHost, *redisAuth, *redisStreamKey;
-	struct timeval redisTimeout = { 1, 500000 }; // 1.5 seconds
+	struct timeval timeout = { 1, 500000 }; // 1.5 seconds
 	int redisPort = 6379; // the default
 
+	char *redisHost=NULL, *redisAuth=NULL, *redisUnixSocket=NULL;
+	redisContext *ctx = NULL;
+	redisReply *reply = NULL;
 	config_rec *config;
-	redisSSLContext *ssl;
-	redisSSLContextError ssl_error;
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before find_config('RedisHost')");
+
+	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisHost",FALSE);
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: after find_config('RedisHost')");
+	if (NULL!=config && strlen(config->argv[0]))
+	{
+		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before trying to read 'RedisHost': %lu",
+			strlen(config->argv[0]));
+		redisHost = (char *)config->argv[0];
+		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: found RedisHost: '%s'",
+			redisHost);
+	}
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: beforefind_config('RedisUnixSocket')");
+
+	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisUnixSocket",FALSE);
+	if (NULL!=config && strlen(config->argv[0]))
+	{
+		redisUnixSocket = (char *)config->argv[0];
+		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: found RedisUnixSocket: '%s'",
+			redisUnixSocket);
+	}
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: 'RedisHost' & 'RedisUnixSocket' empty check...");
+
+	if (NULL==redisHost && NULL==redisUnixSocket)
+	{
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": A 'RedisHost' or 'RedisUnixSocket' is required (both were blank or missing) "
+			"- cannot send notification");
+		return NULL;
+	}
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before find_config('RedisPort') ");
+
+
+	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisPort",FALSE);
+	if (config && strlen(config->argv[0]))
+	{
+		redisPort = atoi((char *)config->argv[0]);
+		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: found RedisPort: '%d'",
+			redisPort);
+	}
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before find_config('RedisAuth') ");
+
+	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisAuth",FALSE);
+	if (config && strlen(config->argv[0]))
+	{
+		redisAuth = (char *)config->argv[0];
+		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: found RedisAuth: ***");
+	}
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before redisConnect...() ");
+
+	if (NULL!=redisUnixSocket)
+	{
+		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: attempting UnixSocketConnection: %s",
+			redisUnixSocket);
+		ctx = redisConnectUnixWithTimeout(redisUnixSocket, timeout);
+		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: done attempting UnixSocketConnection");
+
+	}
+	else
+		ctx = redisConnectWithTimeout(redisHost, redisPort, timeout);
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: after redisConnect...() ");
+
+	if (NULL==ctx || ctx->err)
+	{
+		if (ctx)
+		{
+			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+				": Connection error: %s\n", ctx->errstr);
+			redisFree(ctx);
+		}
+		else
+			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+				": Connection error: can't allocate redis context\n");
+		return NULL;
+	}
+
+	if (redisAuth)
+	{
+		reply = redisCommand(ctx,"AUTH %s", redisAuth);
+		if (REDIS_REPLY_STATUS!=reply->type || strcmp("OK",reply->str))
+		{
+			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+				": DEBUG strcmp()=%d", strcmp("OK",reply->str));
+			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+				": AUTH Failure - Wrong 'RedisAuth' value?: %d - '%s'\n", reply->type, reply->str);
+
+			freeReplyObject(reply);
+			redisFree(ctx);
+			return NULL;
+		}
+		freeReplyObject(reply);
+	}
+	return ctx;
+}
+
+static int push_redis_stream_notification(json_object *msg)
+{
+	char *redisStreamKey;
+
+	config_rec *config;
 	redisContext *redisCtx;
 	redisReply *reply;
 
-	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisHost",FALSE);
-	if (!config || !strlen(config->argv[0]))
-	{
-		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
-			": 'RedisHost' parameter mising or blank - cannot send notification");
-		return 1;
-	}
-	redisHost = (char *) config->argv[0];
 
 	config = find_config(CURRENT_CONF, CONF_PARAM,"NotifyStreamName",FALSE);
 	if (!config || !strlen(config->argv[0]))
@@ -146,89 +268,37 @@ static int push_redis_stream_notification(json_object *msg)
 	}
 	redisStreamKey = (char *) config->argv[0];
 
-	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisPort",FALSE);
-	if (config && strlen(config->argv[0]))
-		redisPort = atoi((char *)config->argv[0]);
 
-	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisAuth",FALSE);
-	if (config && strlen(config->argv[0]))
-		redisAuth = (char *)config->argv[0];
-	else
-		redisAuth = NULL;
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before call to get_redis_context()");
+	redisCtx = get_redis_context();
 
-	redisInitOpenSSL();
-	ssl = redisCreateSSLContext(NULL, "/etc/ssl/certs", NULL, NULL, NULL, &ssl_error);
-	if (!ssl)
+	if (NULL==redisCtx)
 	{
 		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
-			": SSL Context error: %s\n", redisSSLContextGetError(ssl_error));
+			": Failed to connect - cannot send notification\n");
 		return 1;
 	}
 
-	redisOptions options = {0};
-	REDIS_OPTIONS_SET_TCP(&options, redisHost, redisPort);
-	options.connect_timeout = &redisTimeout;
-	redisCtx = redisConnectWithOptions(&options);
-
-	if (NULL==redisCtx || redisCtx->err)
-	{
-		if (redisCtx)
-		{
-			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
-				": Connection error: %s\n", redisCtx->errstr);
-			redisFree(redisCtx);
-		}
-		else
-			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
-				": Connection error: can't allocate redis context\n");
-		return 1;
-	}
-
-	if (REDIS_OK!=redisInitiateSSLWithContext(redisCtx, ssl))
-	{
-		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
-			": Couldn't initialize SSL!\n");
-		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
-			": Error: %s\n", redisCtx->errstr);
-		redisFree(redisCtx);
-		return 1;
-	}
-
-	if (redisAuth)
-	{
-		reply = redisCommand(redisCtx,"AUTH %s", redisAuth);
-		if (REDIS_OK!=reply->type)
-		{
-			pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
-				": AUTH Failure - Wrong 'RedisAuth' value?: %s\n", reply->str);
-
-			freeReplyObject(reply);
-			redisFree(redisCtx);
-			redisFreeSSLContext(ssl);
-			return 1;
-		}
-
-		freeReplyObject(reply);
-	}
-
-	reply = redisCommand(redisCtx, "XADD \"%s\" MAXLEN ~ 10000 * sftpDropOff \"%s\"",
+	reply = redisCommand(redisCtx, "XADD %s MAXLEN ~ 10000 * sftpDropOff %s",
 		redisStreamKey, json_object_to_json_string(msg));
 
-	if (REDIS_OK!=reply->type)
+	if (REDIS_REPLY_STRING!=reply->type)
 	{
 		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
-			": Failed to push notification to redis stream: %s\n",
-			reply->str);
+			": Failed to push notification to redis stream: %d - '%s'\n",
+			reply->type, reply->str);
 		freeReplyObject(reply);
 		redisFree(redisCtx);
-		redisFreeSSLContext(ssl);
 		return 1;
 	}
+	else
+		pr_log_pri(PR_LOG_INFO, MOD_RESTNOTIFY_VERSION
+			": Message successfully queued: '%s'",
+			reply->str);
 
 	
 	freeReplyObject(reply);
 	redisFree(redisCtx);
-	redisFreeSSLContext(ssl);
 	return 0;
 }
 
@@ -452,6 +522,7 @@ MODRET capture_rename_to(cmd_rec *cmd)
 
 
 static conftable restnotify_conftab[] = {
+  { "RedisUnixSocket", set_config_redis_unix_socket, NULL },
   { "RedisHost", set_config_redis_host, NULL },
   { "RedisPort", set_config_redis_port, NULL },
   { "RedisAuth", set_config_redis_auth, NULL },
@@ -464,7 +535,7 @@ static cmdtable restnotify_cmdtab[] = {
    { POST_CMD, C_STOU, G_NONE, capture_upload, TRUE, FALSE },
    { POST_CMD, C_APPE, G_NONE, capture_upload, TRUE, FALSE },
    { POST_CMD, C_RNTO, G_NONE, capture_rename_to, TRUE, FALSE },
-	{ POST_CMD, C_DELE, G_NONE, capture_delete, TRUE, FALSE },
+   { POST_CMD, C_DELE, G_NONE, capture_delete, TRUE, FALSE },
    { 0, NULL }
 };
 
