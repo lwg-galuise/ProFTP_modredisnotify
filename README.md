@@ -13,13 +13,7 @@ To build this module issue the following commands on any Linux machine
 with ProFTPD installed:
 
 ```sh
-sudo prcx -c -i -d -l jason-c mod_restnotify.c
-```
-
-Once the libhiredis code is in place the build command will change to:
-
-```sh
-prxs -c -i -d -L /usr/lib/x86_64-linux-gnu/ -l json-c -l :libhiredis.so.0.14 mod_restnotify.c
+sudo prxs -c -d -i -I /usr/include/hiredis -L /usr/lib/x86_64-linux-gnu/ mod_restnotify.c
 ```
 
 **NOTE:** The above command assumes the version 0.14 libhiredis.so
@@ -35,20 +29,33 @@ LoadModule mod_restnotify.c
 
 Finally, the following configuration block will need to be added to
 either the /etc/proftpd/proftpd.conf file or to one of the
-/etc/proftpd/conf.d/ files:
+/etc/proftpd/conf.d/ files (below is an example config):
 
+**A TCP-based connection**
 ```
 <IfModule mod_restnotify.c>
-        NotifyEndpoint iface.hq.longwoodgardens.org
+        RedisHost 127.0.0.1
+        RedisPort 16379
+        RedisAuth "PASSWORD GOES HERE"
+        RedisStreamMaxSize 100
+        NotifyStreamName sftp.longwood:notify
 </IfModule mod_restnotify.c>
 ```
 
+**A UNIX Domain Socket-based connection**
+```
+<IfModule mod_restnotify.c>
+        RedisUnixSocket /var/run/redis/redis-server.sock
+        RedisAuth "PASSWORD GOES HERE"
+        RedisStreamMaxSize 100
+        NotifyStreamName sftp.longwood:notify
+</IfModule mod_restnotify.c>
+```
 
-There will most likely be more parameters to follow and this README.md
-file will be upadated as those parameters are added.
-
-Currently the "notify" portion of the code is not implemented and will
-need to be added.  The module is currently capturing the needed data
-for the notification and dumping it to the debug log.  However, it's a
-proof of concept.
-
+**NOTE:** This module's filesystem access is restricted by the chroot
+"jail" if the "DefaultRoot" parameter is used to restrict the forked
+protftpd server process that handles each client connection.  Thus,
+if you restrict a user to ```DefaultRoot /home/%u``` the path of
+```/var/run/redis/redis-server.sock``` will be inaccessible and the
+module will complain (in the logs) that the path does not exist /
+the connection will fail.
