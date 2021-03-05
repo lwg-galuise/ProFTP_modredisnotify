@@ -58,6 +58,21 @@ MODRET set_config_notify_stream_name(cmd_rec *cmd) {
 }
 
 /**
+ * Configuration setter: redisStreamMaxSize
+ */
+MODRET set_config_redis_stream_maxsize(cmd_rec *cmd) {
+  config_rec *c = NULL;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_DIR);
+
+  c = add_config_param_str("RedisStreamMaxSize", 1, (void *) cmd->argv[1]);
+  c->flags |= CF_MERGEDOWN;
+
+  return PR_HANDLED(cmd);
+}
+
+/**
  * Configuration setter: redisUnixSocket
  */
 MODRET set_config_redis_unix_socket(cmd_rec *cmd) {
@@ -149,20 +164,13 @@ static redisContext* get_redis_context()
 	redisReply *reply = NULL;
 	config_rec *config;
 
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before find_config('RedisHost')");
-
 	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisHost",FALSE);
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: after find_config('RedisHost')");
 	if (NULL!=config && strlen(config->argv[0]))
 	{
-		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before trying to read 'RedisHost': %lu",
-			strlen(config->argv[0]));
 		redisHost = (char *)config->argv[0];
 		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: found RedisHost: '%s'",
 			redisHost);
 	}
-
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: beforefind_config('RedisUnixSocket')");
 
 	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisUnixSocket",FALSE);
 	if (NULL!=config && strlen(config->argv[0]))
@@ -172,8 +180,6 @@ static redisContext* get_redis_context()
 			redisUnixSocket);
 	}
 
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: 'RedisHost' & 'RedisUnixSocket' empty check...");
-
 	if (NULL==redisHost && NULL==redisUnixSocket)
 	{
 		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
@@ -181,9 +187,6 @@ static redisContext* get_redis_context()
 			"- cannot send notification");
 		return NULL;
 	}
-
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before find_config('RedisPort') ");
-
 
 	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisPort",FALSE);
 	if (config && strlen(config->argv[0]))
@@ -193,8 +196,6 @@ static redisContext* get_redis_context()
 			redisPort);
 	}
 
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before find_config('RedisAuth') ");
-
 	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisAuth",FALSE);
 	if (config && strlen(config->argv[0]))
 	{
@@ -202,20 +203,10 @@ static redisContext* get_redis_context()
 		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: found RedisAuth: ***");
 	}
 
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before redisConnect...() ");
-
 	if (NULL!=redisUnixSocket)
-	{
-		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: attempting UnixSocketConnection: %s",
-			redisUnixSocket);
 		ctx = redisConnectUnixWithTimeout(redisUnixSocket, timeout);
-		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: done attempting UnixSocketConnection");
-
-	}
 	else
 		ctx = redisConnectWithTimeout(redisHost, redisPort, timeout);
-
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: after redisConnect...() ");
 
 	if (NULL==ctx || ctx->err)
 	{
@@ -230,6 +221,8 @@ static redisContext* get_redis_context()
 				": Connection error: can't allocate redis context\n");
 		return NULL;
 	}
+
+	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: Connected.");
 
 	if (redisAuth)
 	{
@@ -246,6 +239,7 @@ static redisContext* get_redis_context()
 			return NULL;
 		}
 		freeReplyObject(reply);
+		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: Successfully authenticated.");
 	}
 	return ctx;
 }
@@ -254,6 +248,7 @@ static int push_redis_stream_notification(json_object *msg)
 {
 	char *redisStreamKey;
 
+	int redisStreamMaxSize = 50; // Default to ~ 50 messages...
 	config_rec *config;
 	redisContext *redisCtx;
 	redisReply *reply;
@@ -268,8 +263,27 @@ static int push_redis_stream_notification(json_object *msg)
 	}
 	redisStreamKey = (char *) config->argv[0];
 
+	config = find_config(CURRENT_CONF, CONF_PARAM,"RedisStreamMaxSize",FALSE);
+	if (config && strlen(config->argv[0]))
+	{
+		int value = (int) strtoimax((char *)config->argv[0],NULL,10);
+		if (value > 0)
+		{
+			redisStreamMaxSize = value;
+			pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: found RedisStreamMaxSize: '%d'",
+				redisStreamMaxSize);
+		}
+		else
+			pr_log_pri(PR_LOG_WARNING, MOD_RESTNOTIFY_VERSION
+				": RedisStreamMaxSize value was invalid (using default of %d): '%s' was specified",
+				redisStreamMaxSize, (char *)config->argv[0]);
+	}
+	else
+		pr_log_pri(PR_LOG_WARNING, MOD_RESTNOTIFY_VERSION
+			": RedisStreamMaxSize value was blank or missing (using default of %d)",
+			redisStreamMaxSize);
 
-	pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: before call to get_redis_context()");
+
 	redisCtx = get_redis_context();
 
 	if (NULL==redisCtx)
@@ -279,8 +293,8 @@ static int push_redis_stream_notification(json_object *msg)
 		return 1;
 	}
 
-	reply = redisCommand(redisCtx, "XADD %s MAXLEN ~ 10000 * sftpDropOff %s",
-		redisStreamKey, json_object_to_json_string(msg));
+	reply = redisCommand(redisCtx, "XADD %s MAXLEN ~ %d * sftpDropOff %s",
+		redisStreamKey,redisStreamMaxSize,json_object_to_json_string(msg));
 
 	if (REDIS_REPLY_STRING!=reply->type)
 	{
@@ -526,6 +540,7 @@ static conftable restnotify_conftab[] = {
   { "RedisHost", set_config_redis_host, NULL },
   { "RedisPort", set_config_redis_port, NULL },
   { "RedisAuth", set_config_redis_auth, NULL },
+  { "RedisStreamMaxSize", set_config_redis_stream_maxsize, NULL },
   { "NotifyStreamName", set_config_notify_stream_name, NULL },
   { NULL }
 };
