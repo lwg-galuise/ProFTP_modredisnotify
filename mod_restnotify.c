@@ -57,6 +57,18 @@ MODRET set_config_notify_stream_name(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
+MODRET set_config_notify_pubsub_channel_name(cmd_rec *cmd) {
+  config_rec *c = NULL;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_DIR);
+
+  c = add_config_param_str("NotifyPubSubChannelName", 1, (void *) cmd->argv[1]);
+  c->flags |= CF_MERGEDOWN;
+
+  return PR_HANDLED(cmd);
+}
+
 /**
  * Configuration setter: redisStreamMaxSize
  */
@@ -244,9 +256,9 @@ static redisContext* get_redis_context()
 	return ctx;
 }
 
-static int push_redis_stream_notification(json_object *msg)
+static int push_redis_stream_notification(json_object *msg, char *outStreamID)
 {
-	char *redisStreamKey;
+	char *redisStreamKey, *redisPubSubChannel;
 
 	int redisStreamMaxSize = 50; // Default to ~ 50 messages...
 	config_rec *config;
@@ -283,6 +295,14 @@ static int push_redis_stream_notification(json_object *msg)
 			": RedisStreamMaxSize value was blank or missing (using default of %d)",
 			redisStreamMaxSize);
 
+	config = find_config(CURRENT_CONF, CONF_PARAM,"NotifyPubSubChannelName",FALSE);
+	if (!config || !strlen(config->argv[0]))
+	{
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": 'NotifyPubSubChannelName' parameter missing or blank - cannot send notification");
+		return 1;
+	}
+	redisPubSubChannel = (char *) config->argv[0];
 
 	redisCtx = get_redis_context();
 
@@ -305,10 +325,44 @@ static int push_redis_stream_notification(json_object *msg)
 		redisFree(redisCtx);
 		return 1;
 	}
-	else
-		pr_log_pri(PR_LOG_INFO, MOD_RESTNOTIFY_VERSION
-			": Message successfully queued: '%s'",
-			reply->str);
+
+	outStreamID = pstrndup(session.pool,reply->str,strlen(reply->str));	
+
+	pr_log_pri(PR_LOG_INFO, MOD_RESTNOTIFY_VERSION
+		": Message successfully queued: '%s'",
+		outStreamID);
+
+
+	freeReplyObject(reply);
+
+
+	json_object *pubSubMsg = json_object_new_object();
+	json_object_object_add(pubSubMsg,"streamMessageID",json_object_new_string(outStreamID));
+	json_object_object_add(pubSubMsg,"detail",msg);
+
+	pr_log_pri(PR_LOG_DEBUG, MOD_RESTNOTIFY_VERSION
+		": PubSubChannel: '%s'",
+		redisPubSubChannel);
+
+	reply = redisCommand(redisCtx, "PUBLISH %s %s",
+		redisPubSubChannel,json_object_to_json_string(pubSubMsg));
+
+	json_object_put(pubSubMsg); // free the json_object after serialization.
+
+	if (REDIS_REPLY_INTEGER!=reply->type)
+	{
+		pr_log_pri(PR_LOG_ERR, MOD_RESTNOTIFY_VERSION
+			": Failed to push notification to redis pub/sub channel: %d - '%s'\n",
+			reply->type, reply->str);
+		freeReplyObject(reply);
+		redisFree(redisCtx);
+		return 1;
+	}
+
+	pr_log_pri(PR_LOG_INFO, MOD_RESTNOTIFY_VERSION
+		": Pub/Sub Message successfully queued: '%s'",
+		reply->str);
+
 
 	
 	freeReplyObject(reply);
@@ -346,7 +400,7 @@ static void restnotify_shutdown(const void *event_data, void *user_data)
 		pr_log_debug(DEBUG4, MOD_RESTNOTIFY_VERSION ": debug: JSON: %s",
 			json_object_to_json_string(msg));
 
-		push_redis_stream_notification(msg);
+		push_redis_stream_notification(msg, NULL);
 		
 		//cJSON_Delete(msg);
 
@@ -542,6 +596,7 @@ static conftable restnotify_conftab[] = {
   { "RedisAuth", set_config_redis_auth, NULL },
   { "RedisStreamMaxSize", set_config_redis_stream_maxsize, NULL },
   { "NotifyStreamName", set_config_notify_stream_name, NULL },
+  { "NotifyPubSubChannelName", set_config_notify_pubsub_channel_name, NULL },
   { NULL }
 };
 

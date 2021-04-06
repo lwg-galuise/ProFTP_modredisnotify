@@ -38,7 +38,8 @@ either the /etc/proftpd/proftpd.conf file or to one of the
         RedisPort 16379
         RedisAuth "PASSWORD GOES HERE"
         RedisStreamMaxSize 100
-        NotifyStreamName sftp.longwood:notify
+        NotifyStreamName sftp.server:notify
+        NotifyPubSubChannelName sftpDropOff.sftp.server:notify
 </IfModule mod_restnotify.c>
 ```
 
@@ -48,7 +49,8 @@ either the /etc/proftpd/proftpd.conf file or to one of the
         RedisUnixSocket /var/run/redis/redis-server.sock
         RedisAuth "PASSWORD GOES HERE"
         RedisStreamMaxSize 100
-        NotifyStreamName sftp.longwood:notify
+        NotifyStreamName sftp.server:notify
+        NotifyPubSubChannelName sftpDropOff.sftp.server:notify
 </IfModule mod_restnotify.c>
 ```
 
